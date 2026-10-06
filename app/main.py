@@ -30,6 +30,8 @@ from .schemas import (
     OpeningCodeStatusOut,
     PoolCreate,
     PoolOut,
+    ProgressCertificateCreate,
+    ProgressCertificateOut,
     RedeemRequest,
     RedemptionOut,
     RescheduleOut,
@@ -83,8 +85,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.6.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签与实体放映拷贝分配",
+        version="1.7.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签、实体放映拷贝分配与场馆日放映进度凭证封存",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -118,7 +120,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.5.0",
+            "version": "1.7.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -543,6 +545,55 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def get_copy_assignment(idempotency_key: str):
         """查询场次当前的拷贝分配状态；未分配时 assigned=false。未知键 404。"""
         return store.get_copy_assignment(idempotency_key)
+
+    # ------------------------------------------------------------------
+    # venue-day progress certificates (sealed snapshots for distributors)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/progress-certificates",
+        response_model=ProgressCertificateOut,
+        tags=["progress-certificates"],
+    )
+    def seal_progress_certificate(body: ProgressCertificateCreate):
+        """封存某场馆某日放映进度凭证（幂等）。
+
+        - 按受理时刻封存：当前排片落在该日**本地时间范围**（所给 IANA 时区的
+          本地午夜到次日午夜，左闭右开）内、已核准且未取消的场次；明细含原
+          核验键、当前开场时间、当前授权及额度池、已分配拷贝编号与开场码
+          核销时间（未核销为 null）；汇总已核销/未核销场数（未开场场次计入
+          未核销）；空日返回空清单与零计数；
+        - 非法日期 422；未知 IANA 时区 422 UNKNOWN_TIMEZONE；
+        - 同凭证号同参数重试返回首次快照（replay=true），同号异参数 409；
+        - 封存在单个 ``BEGIN IMMEDIATE`` 事务内完成，与并发改签/取消/核销
+          完全串行，凭证只反映其中一个完整状态；封存后查询恒返回首次内容。
+        """
+        return store.seal_progress_certificate(
+            certificate_no=body.certificate_no,
+            venue_id=body.venue_id,
+            local_date=body.local_date,
+            timezone_name=body.timezone,
+        )
+
+    @app.get(
+        "/progress-certificates",
+        response_model=list[ProgressCertificateOut],
+        tags=["progress-certificates"],
+    )
+    def list_progress_certificates(
+        venue_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ):
+        """已封存凭证列表（含明细），可按 venue_id 过滤；内容恒为封存时快照。"""
+        return store.list_progress_certificates(venue_id=venue_id, limit=limit)
+
+    @app.get(
+        "/progress-certificates/{certificate_no}",
+        response_model=ProgressCertificateOut,
+        tags=["progress-certificates"],
+    )
+    def get_progress_certificate(certificate_no: str):
+        """按凭证号查询已封存凭证；内容保持封存时的首次快照。未知凭证号 404。"""
+        return store.get_progress_certificate(certificate_no)
 
     return app
 

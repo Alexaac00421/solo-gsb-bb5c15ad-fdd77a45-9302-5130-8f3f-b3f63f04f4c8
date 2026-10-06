@@ -160,6 +160,45 @@ CREATE TABLE IF NOT EXISTS copy_assignments (
 );
 CREATE INDEX IF NOT EXISTS idx_copy_assignments_copy
     ON copy_assignments (copy_id);
+
+-- 场馆日放映进度凭证：影展运营向发行方留存的"某场馆某日放映进度"快照。
+-- 提交场馆编号 + 当地日期 + IANA 时区 + 全库唯一凭证号，按受理时刻封存当前
+-- 排片落在该日本地时间范围内（本地午夜到次日午夜，换算为 UTC 左闭右开）、
+-- 已核准且未取消的场次。certificate_no 全库唯一：同号同参数重试返回首次
+-- 快照，同号异参数 409。封存内容（明细与计数）一经写入不再变化，此后的
+-- 改签、取消、核销都不影响已封存凭证，查询恒返回首次内容。
+CREATE TABLE IF NOT EXISTS progress_certificates (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    certificate_no   TEXT    NOT NULL UNIQUE,      -- 全库唯一凭证号
+    request_hash     TEXT    NOT NULL,             -- 场馆+当地日期+时区 内容指纹
+    venue_id         TEXT    NOT NULL,
+    local_date       TEXT    NOT NULL,             -- 当地日期 YYYY-MM-DD
+    timezone         TEXT    NOT NULL,             -- IANA 时区名（如 Asia/Shanghai）
+    day_start_utc    TEXT    NOT NULL,             -- 该日本地 00:00 对应的 UTC（左闭）
+    day_end_utc      TEXT    NOT NULL,             -- 次日本地 00:00 对应的 UTC（右开）
+    session_count    INTEGER NOT NULL,             -- 封存场次总数
+    redeemed_count   INTEGER NOT NULL,             -- 已核销场数
+    unredeemed_count INTEGER NOT NULL,             -- 未核销场数（未开场场次计入）
+    sealed_at        TEXT    NOT NULL              -- 受理封存时刻（UTC）
+);
+CREATE INDEX IF NOT EXISTS idx_progress_certificates_venue
+    ON progress_certificates (venue_id, id);
+
+-- 凭证明细：封存时点的场次快照（原核验键、当前开场时刻、当前授权与额度池、
+-- 已分配拷贝编号、开场码核销时间），一经写入不再变化。
+CREATE TABLE IF NOT EXISTS progress_certificate_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    certificate_id  INTEGER NOT NULL REFERENCES progress_certificates (id),
+    verification_id INTEGER NOT NULL REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL,              -- 原核验幂等键
+    start_time      TEXT    NOT NULL,              -- 封存时的当前开场时刻（UTC）
+    license_id      INTEGER,                       -- 封存时的当前授权
+    pool_id         INTEGER,                       -- 封存时的当前额度池；未绑池为 NULL
+    copy_code       TEXT,                          -- 封存时已分配拷贝编号；未分配为 NULL
+    redeemed_at     TEXT                           -- 封存时的核销时间；未核销为 NULL
+);
+CREATE INDEX IF NOT EXISTS idx_progress_certificate_items_cert
+    ON progress_certificate_items (certificate_id);
 """
 
 # Columns added after the initial release; applied lazily so databases

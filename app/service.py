@@ -8,8 +8,9 @@ import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Iterator, Optional
+from zoneinfo import ZoneInfo
 
 from .db import connect, init_schema
 from .timeutil import now_iso, parse_iso, to_iso
@@ -52,6 +53,9 @@ COPY_REASON_FILM_MISMATCH = "COPY_FILM_MISMATCH"      # 拷贝与场次不同片
 COPY_REASON_ASSIGNMENT_REQUIRED = "COPY_ASSIGNMENT_REQUIRED"  # 已配置拷贝的影片领码前须先分配
 COPY_CODE_CONFLICT = "COPY_CONFLICT"                  # 分配与既有占用冲突（409，不落账）
 COPY_CODE_NOT_FOUND = "COPY_NOT_FOUND"                # 拷贝编号未知（404）
+
+# 放映进度凭证封存的业务错误码（422，不产生凭证）
+CERT_REASON_UNKNOWN_TIMEZONE = "UNKNOWN_TIMEZONE"     # 未知 IANA 时区
 
 # 已取消的核准流水不再占用授权/池额度：取消登记后实时已用次数回退，
 # 释放出的额度可被后续核验使用；原核验行及其快照保持原样。
@@ -236,6 +240,17 @@ def _hash_reschedule(idempotency_key: str, new_start_iso: str) -> str:
     """Idempotency fingerprint of a reschedule op (original key + new start)."""
     payload = json.dumps(
         {"idempotency_key": idempotency_key, "new_start_time": new_start_iso},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hash_certificate(venue_id: str, local_date: str, timezone_name: str) -> str:
+    """Idempotency fingerprint of a progress-certificate seal request."""
+    payload = json.dumps(
+        {"venue_id": venue_id, "local_date": local_date,
+         "timezone": timezone_name},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -607,6 +622,73 @@ def _opening_status_out(row: Optional[sqlite3.Row], key: str,
             if status == "redeemed"
             else None
         ),
+    }
+
+
+# 进度凭证封存快照：当前排片落在 [day_start, day_end)（UTC）内、已核准且未取消
+# 的场次。当前开场时刻/当前授权/当前额度池由"最近一次成功改签"派生（区别于
+# 原核验行的不可变快照）；拷贝编号与开场码核销时间在封存时刻一次性读出，
+# 写入凭证明细后不再变化。每个核验场次至多一行（各联表均有唯一约束兜底）。
+_CERTIFICATE_SNAPSHOT_SELECT = f"""
+SELECT
+    v.id              AS verification_id,
+    v.idempotency_key AS idempotency_key,
+    {_EFFECTIVE_START_EXPR}   AS start_time,
+    {_EFFECTIVE_LICENSE_EXPR} AS license_id,
+    {_EFFECTIVE_POOL_EXPR}    AS pool_id,
+    fc.copy_code      AS copy_code,
+    rd.redeemed_at    AS redeemed_at
+FROM verifications v
+LEFT JOIN copy_assignments a ON a.verification_id = v.id
+LEFT JOIN film_copies fc ON fc.id = a.copy_id
+LEFT JOIN opening_codes oc ON oc.verification_id = v.id
+LEFT JOIN redemptions rd ON rd.opening_code_id = oc.id
+WHERE v.venue_id = ?
+  AND v.decision = 'approved'
+  AND NOT EXISTS (
+      SELECT 1 FROM cancellations c WHERE c.verification_id = v.id
+  )
+  AND {_EFFECTIVE_START_EXPR} >= ?
+  AND {_EFFECTIVE_START_EXPR} < ?
+ORDER BY start_time ASC, v.id ASC
+"""
+
+
+def _certificate_out(conn: sqlite3.Connection, cert_row: sqlite3.Row,
+                     replay: bool) -> dict:
+    """Certificate payload with its frozen item lines (immutable once sealed)."""
+    items = conn.execute(
+        """
+        SELECT * FROM progress_certificate_items
+        WHERE certificate_id = ? ORDER BY start_time ASC, id ASC
+        """,
+        (cert_row["id"],),
+    ).fetchall()
+    return {
+        "id": cert_row["id"],
+        "certificate_no": cert_row["certificate_no"],
+        "venue_id": cert_row["venue_id"],
+        "local_date": cert_row["local_date"],
+        "timezone": cert_row["timezone"],
+        "day_start_utc": cert_row["day_start_utc"],
+        "day_end_utc": cert_row["day_end_utc"],
+        "session_count": cert_row["session_count"],
+        "redeemed_count": cert_row["redeemed_count"],
+        "unredeemed_count": cert_row["unredeemed_count"],
+        "sealed_at": cert_row["sealed_at"],
+        "items": [
+            {
+                "idempotency_key": it["idempotency_key"],
+                "verification_id": it["verification_id"],
+                "start_time": it["start_time"],
+                "license_id": it["license_id"],
+                "pool_id": it["pool_id"],
+                "copy_code": it["copy_code"],
+                "redeemed_at": it["redeemed_at"],
+            }
+            for it in items
+        ],
+        "replay": replay,
     }
 
 
@@ -2341,3 +2423,149 @@ class Store:
                 except sqlite3.Error:
                     pass
                 raise
+
+    # ------------------------------------------------------------------
+    # venue-day progress certificates (sealed snapshots for distributors)
+    # ------------------------------------------------------------------
+    def seal_progress_certificate(
+        self,
+        *,
+        certificate_no: str,
+        venue_id: str,
+        local_date: date,
+        timezone_name: str,
+    ) -> dict:
+        """Seal a venue-day screening-progress certificate (idempotent).
+
+        The local calendar day in the given IANA timezone becomes a
+        half-open UTC window ``[local midnight, next local midnight)``;
+        every approved, non-cancelled verification of the venue whose
+        **current** schedule (latest successful reschedule, else the
+        original slot) falls in that window is frozen into the
+        certificate with its current license/pool, assigned copy code
+        and redemption time.  Sessions without a redemption — including
+        ones that have not started yet — count as unredeemed; a day
+        with no matching sessions seals an empty certificate with zero
+        counts.
+
+        The snapshot is read and persisted inside one
+        ``BEGIN IMMEDIATE`` transaction, serialised against concurrent
+        reschedules, cancellations and redemptions by the SQLite write
+        lock, so the certificate always reflects exactly one complete
+        state and never a mix of before/after.  Re-sealing the same
+        certificate number with the same parameters returns the first
+        snapshot (``replay=True``); the same number with different
+        parameters conflicts (409).  Once sealed the content never
+        changes again.
+        """
+        try:
+            tz = ZoneInfo(timezone_name)
+        except (KeyError, ValueError, OSError):
+            # ZoneInfoNotFoundError 是 KeyError 子类；非法键、越界路径与
+            # 损坏的时区数据统一按"未知时区"拒绝，不产生任何记录
+            raise UnprocessableError(
+                f"unknown IANA timezone '{timezone_name}'",
+                code=CERT_REASON_UNKNOWN_TIMEZONE,
+            )
+        # 本地午夜到次日午夜（zoneinfo 按墙钟推进，跨夏令时切换仍取本地 00:00）
+        day_start_local = datetime(
+            local_date.year, local_date.month, local_date.day, tzinfo=tz
+        )
+        day_end_local = day_start_local + timedelta(days=1)
+        day_start_utc, day_end_utc = to_iso(day_start_local), to_iso(day_end_local)
+        local_date_iso = local_date.isoformat()
+        request_hash = _hash_certificate(venue_id, local_date_iso, timezone_name)
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT * FROM progress_certificates WHERE certificate_no = ?",
+                    (certificate_no,),
+                ).fetchone()
+                if existing is not None:
+                    payload = _certificate_out(conn, existing, replay=True)
+                    if existing["request_hash"] != request_hash:
+                        conn.execute("ROLLBACK")
+                        raise ConflictError(
+                            f"progress certificate '{certificate_no}' was "
+                            "already sealed with different parameters",
+                            existing=payload,
+                        )
+                    conn.execute("COMMIT")
+                    return payload
+
+                rows = conn.execute(
+                    _CERTIFICATE_SNAPSHOT_SELECT,
+                    (venue_id, day_start_utc, day_end_utc),
+                ).fetchall()
+                redeemed = sum(1 for r in rows if r["redeemed_at"] is not None)
+                sealed_at = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO progress_certificates
+                        (certificate_no, request_hash, venue_id, local_date,
+                         timezone, day_start_utc, day_end_utc, session_count,
+                         redeemed_count, unredeemed_count, sealed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (certificate_no, request_hash, venue_id, local_date_iso,
+                     timezone_name, day_start_utc, day_end_utc, len(rows),
+                     redeemed, len(rows) - redeemed, sealed_at),
+                )
+                certificate_id = cur.lastrowid
+                for row in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO progress_certificate_items
+                            (certificate_id, verification_id, idempotency_key,
+                             start_time, license_id, pool_id, copy_code,
+                             redeemed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (certificate_id, row["verification_id"],
+                         row["idempotency_key"], row["start_time"],
+                         row["license_id"], row["pool_id"], row["copy_code"],
+                         row["redeemed_at"]),
+                    )
+                cert = conn.execute(
+                    "SELECT * FROM progress_certificates WHERE id = ?",
+                    (certificate_id,),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return _certificate_out(conn, cert, replay=False)
+            except (ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_progress_certificate(self, certificate_no: str) -> dict:
+        """Sealed certificate by number; the content is the first snapshot."""
+        with self._connection() as conn:
+            cert = conn.execute(
+                "SELECT * FROM progress_certificates WHERE certificate_no = ?",
+                (certificate_no,),
+            ).fetchone()
+            if cert is None:
+                raise NotFoundError(
+                    f"progress certificate '{certificate_no}' not found"
+                )
+            return _certificate_out(conn, cert, replay=False)
+
+    def list_progress_certificates(
+        self, *, venue_id: Optional[str] = None, limit: int = 200
+    ) -> list:
+        """Sealed certificates (with frozen items), newest first."""
+        sql = "SELECT * FROM progress_certificates"
+        params: list = []
+        if venue_id is not None:
+            sql += " WHERE venue_id = ?"
+            params.append(venue_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [_certificate_out(conn, r, replay=False) for r in rows]

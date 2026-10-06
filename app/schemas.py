@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -531,3 +531,73 @@ class CopyConflictsOut(BaseModel):
     start_time: str = Field(description="候选开场时刻（UTC）")
     end_time: str = Field(description="候选占用结束时刻 = 开场 + 片长")
     conflicts: list[CopyConflictItem]
+
+
+# ----------------------------------------------------------------------
+# 场馆日放映进度凭证（封存 / 查询）
+# ----------------------------------------------------------------------
+class ProgressCertificateCreate(BaseModel):
+    """封存某场馆某日放映进度凭证的请求。"""
+
+    certificate_no: str = Field(
+        min_length=1, max_length=128,
+        description="全库唯一凭证号；同号同参数重试返回首次快照，异参数 409",
+        examples=["CERT-HALL1-20261006-001"],
+    )
+    venue_id: str = Field(
+        min_length=1, max_length=128,
+        description="场馆编号",
+        examples=["hall-1"],
+    )
+    local_date: date = Field(
+        description="当地日期（YYYY-MM-DD，按所给时区的本地日历日）；非法日期 422",
+        examples=["2026-10-06"],
+    )
+    timezone: str = Field(
+        min_length=1, max_length=128,
+        description="IANA 时区名，如 Asia/Shanghai；未知时区 422 UNKNOWN_TIMEZONE",
+        examples=["Asia/Shanghai"],
+    )
+
+    @field_validator("certificate_no", "venue_id", "timezone")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class ProgressCertificateItemOut(BaseModel):
+    """凭证明细：封存时点的一场（当前排片/当前授权与池/拷贝/核销时间）。"""
+
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="核验流水 id")
+    start_time: str = Field(description="封存时的当前开场时刻（UTC，含改签）")
+    license_id: Optional[int] = Field(description="封存时的当前授权 id")
+    pool_id: Optional[int] = Field(description="封存时的当前共享池 id；未绑池为 null")
+    copy_code: Optional[str] = Field(description="封存时已分配的拷贝编号；未分配为 null")
+    redeemed_at: Optional[str] = Field(
+        description="封存时的开场码核销时间（UTC）；未核销为 null"
+    )
+
+
+class ProgressCertificateOut(BaseModel):
+    """放映进度凭证；封存后内容不再变化，查询恒返回首次内容。"""
+
+    id: int = Field(description="凭证记录编号")
+    certificate_no: str = Field(description="全库唯一凭证号")
+    venue_id: str
+    local_date: str = Field(description="当地日期（YYYY-MM-DD）")
+    timezone: str = Field(description="IANA 时区名")
+    day_start_utc: str = Field(description="该日本地 00:00 对应的 UTC（左闭）")
+    day_end_utc: str = Field(description="次日本地 00:00 对应的 UTC（右开）")
+    session_count: int = Field(description="封存场次总数（已核准且未取消，落在该日本地时间范围内）")
+    redeemed_count: int = Field(description="已核销场数")
+    unredeemed_count: int = Field(description="未核销场数（未开场场次计入未核销）")
+    sealed_at: str = Field(description="受理封存时刻（UTC）")
+    items: list[ProgressCertificateItemOut] = Field(
+        description="明细，按封存时的当前开场时刻升序；空日为空清单"
+    )
+    replay: bool = Field(
+        description="true 表示同凭证号同参数重试，返回首次快照，未重新封存"
+    )
