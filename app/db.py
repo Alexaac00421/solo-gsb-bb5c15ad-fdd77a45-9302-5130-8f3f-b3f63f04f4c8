@@ -160,6 +160,43 @@ CREATE TABLE IF NOT EXISTS copy_assignments (
 );
 CREATE INDEX IF NOT EXISTS idx_copy_assignments_copy
     ON copy_assignments (copy_id);
+
+-- 放映进度凭证：运营按"场馆 + 当地日期 + IANA 时区"在受理时刻封存当日
+-- （当地自然日，左闭右开）已核准且未取消场次的进度快照，供发行方留存。
+-- voucher_no 全库唯一：同号同参数重试返回首次快照，异参数 409；
+-- 明细与汇总计数在封存时落地，此后查询恒返回首次内容，不随改签/取消/核销变化。
+CREATE TABLE IF NOT EXISTS progress_vouchers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_no       TEXT    NOT NULL UNIQUE,      -- 全库唯一凭证号
+    request_hash     TEXT    NOT NULL,             -- 场馆+当地日期+时区的内容指纹
+    venue_id         TEXT    NOT NULL,
+    local_date       TEXT    NOT NULL,             -- 当地日期 YYYY-MM-DD（规范化后）
+    timezone         TEXT    NOT NULL,             -- IANA 时区名
+    day_start        TEXT    NOT NULL,             -- 当地日起（含）折算 UTC
+    day_end          TEXT    NOT NULL,             -- 当地日止（不含）折算 UTC
+    session_count    INTEGER NOT NULL,             -- 封存场次总数
+    redeemed_count   INTEGER NOT NULL,             -- 其中已核销场数
+    unredeemed_count INTEGER NOT NULL,             -- 其中未核销场数（含未开场）
+    sealed_at        TEXT    NOT NULL              -- 受理封存时刻（UTC）
+);
+CREATE INDEX IF NOT EXISTS idx_progress_vouchers_venue
+    ON progress_vouchers (venue_id);
+
+-- 凭证明细：一行一个封存场次，各字段均为封存时刻的当前值快照。
+CREATE TABLE IF NOT EXISTS progress_voucher_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_id      INTEGER NOT NULL REFERENCES progress_vouchers (id),
+    verification_id INTEGER NOT NULL REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL,              -- 原核验幂等键
+    film_id         TEXT    NOT NULL,
+    start_time      TEXT    NOT NULL,              -- 封存时的当前开场时刻（UTC，含改签）
+    license_id      INTEGER,                       -- 封存时的当前授权
+    pool_id         INTEGER,                       -- 封存时的当前共享额度池；未绑池为 NULL
+    copy_code       TEXT,                          -- 封存时已分配的拷贝编号；未分配为 NULL
+    redeemed_at     TEXT                           -- 开场码核销时间；未核销为 NULL
+);
+CREATE INDEX IF NOT EXISTS idx_progress_voucher_items_voucher
+    ON progress_voucher_items (voucher_id);
 """
 
 # Columns added after the initial release; applied lazily so databases

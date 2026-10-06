@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Iterator, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .db import connect, init_schema
 from .timeutil import now_iso, parse_iso, to_iso
@@ -52,6 +54,10 @@ COPY_REASON_FILM_MISMATCH = "COPY_FILM_MISMATCH"      # 拷贝与场次不同片
 COPY_REASON_ASSIGNMENT_REQUIRED = "COPY_ASSIGNMENT_REQUIRED"  # 已配置拷贝的影片领码前须先分配
 COPY_CODE_CONFLICT = "COPY_CONFLICT"                  # 分配与既有占用冲突（409，不落账）
 COPY_CODE_NOT_FOUND = "COPY_NOT_FOUND"                # 拷贝编号未知（404）
+
+# 放映进度凭证封存的业务错误码（422，不落任何记录）
+VOUCHER_REASON_BAD_DATE = "INVALID_LOCAL_DATE"        # 当地日期非合法 YYYY-MM-DD 日历日
+VOUCHER_REASON_BAD_TIMEZONE = "UNKNOWN_TIMEZONE"      # 非 IANA 时区名
 
 # 已取消的核准流水不再占用授权/池额度：取消登记后实时已用次数回退，
 # 释放出的额度可被后续核验使用；原核验行及其快照保持原样。
@@ -189,6 +195,33 @@ LEFT JOIN reschedules lr ON lr.id = (
 )
 """
 
+# 放映进度凭证的封存快照：某场馆当前排片落在当地日区间 [day_start, day_end)
+# 内、已核准且未取消的场次。开场时刻/授权/池取"当前生效"值（含改签），
+# 拷贝编号取当前分配，核销时间取开场码回执；未分配/未核销为 NULL。
+# 该查询在 BEGIN IMMEDIATE 事务内执行，与改签/取消/核销串行，
+# 因此快照只反映某一完整状态，不混合前后结果。
+_PROGRESS_VOUCHER_SNAPSHOT_SELECT = f"""
+SELECT
+    v.id              AS verification_id,
+    v.idempotency_key AS idempotency_key,
+    v.film_id         AS film_id,
+    {_EFFECTIVE_START_EXPR}   AS start_time,
+    {_EFFECTIVE_LICENSE_EXPR} AS license_id,
+    {_EFFECTIVE_POOL_EXPR}    AS pool_id,
+    fc.copy_code      AS copy_code,
+    rd.redeemed_at    AS redeemed_at
+FROM verifications v
+LEFT JOIN copy_assignments a ON a.verification_id = v.id
+LEFT JOIN film_copies fc ON fc.id = a.copy_id
+LEFT JOIN opening_codes oc ON oc.verification_id = v.id
+LEFT JOIN redemptions rd ON rd.opening_code_id = oc.id
+WHERE v.venue_id = ?
+  AND {_ACTIVE_APPROVED}
+  AND {_EFFECTIVE_START_EXPR} >= ?
+  AND {_EFFECTIVE_START_EXPR} < ?
+ORDER BY start_time ASC, v.id ASC
+"""
+
 
 class ConflictError(Exception):
     """409 — e.g. idempotency key reused with a different payload."""
@@ -240,6 +273,54 @@ def _hash_reschedule(idempotency_key: str, new_start_iso: str) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hash_progress_voucher(venue_id: str, local_date: str, timezone_name: str) -> str:
+    """Idempotency fingerprint of a progress-voucher seal request."""
+    payload = json.dumps(
+        {"venue_id": venue_id, "local_date": local_date, "timezone": timezone_name},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_LOCAL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _local_day_bounds_utc(local_date: str, timezone_name: str) -> tuple:
+    """Validate ``local_date``/``timezone_name`` and compute the UTC window.
+
+    Returns ``(canonical_date, day_start_iso, day_end_iso)`` where the
+    half-open window ``[day_start, day_end)`` is the local civil day
+    (midnight to midnight in the given IANA timezone) expressed in UTC.
+    Invalid dates and unknown timezones are rejected with 422 and leave
+    no record behind.
+    """
+    if not _LOCAL_DATE_RE.match(local_date):
+        raise UnprocessableError(
+            f"local_date '{local_date}' is not a valid YYYY-MM-DD date",
+            code=VOUCHER_REASON_BAD_DATE,
+        )
+    try:
+        day = date.fromisoformat(local_date)
+    except ValueError:
+        raise UnprocessableError(
+            f"local_date '{local_date}' is not a real calendar date",
+            code=VOUCHER_REASON_BAD_DATE,
+        )
+    try:
+        tz = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise UnprocessableError(
+            f"timezone '{timezone_name}' is not a known IANA timezone",
+            code=VOUCHER_REASON_BAD_TIMEZONE,
+        )
+    # 当地日界：本日 00:00（含）到次日 00:00（不含）。zoneinfo 的 utcoffset
+    # 按墙钟时刻求值，因此跨夏令时切换的日期也能得到正确的 UTC 区间。
+    start_local = datetime(day.year, day.month, day.day, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return day.isoformat(), to_iso(start_local), to_iso(end_local)
 
 
 def _pool_brief(row: sqlite3.Row, used: Optional[int] = None) -> Optional[dict]:
@@ -608,6 +689,46 @@ def _opening_status_out(row: Optional[sqlite3.Row], key: str,
             else None
         ),
     }
+
+
+def _progress_voucher_item_out(row: sqlite3.Row) -> dict:
+    """One sealed screening line inside a progress voucher."""
+    return {
+        "idempotency_key": row["idempotency_key"],
+        "verification_id": row["verification_id"],
+        "film_id": row["film_id"],
+        "start_time": row["start_time"],
+        "license_id": row["license_id"],
+        "pool_id": row["pool_id"],
+        "copy_code": row["copy_code"],
+        "redeemed_at": row["redeemed_at"],
+    }
+
+
+def _progress_voucher_summary_out(voucher: sqlite3.Row) -> dict:
+    """Voucher header with the sealed aggregate counts (no items)."""
+    return {
+        "id": voucher["id"],
+        "voucher_no": voucher["voucher_no"],
+        "venue_id": voucher["venue_id"],
+        "local_date": voucher["local_date"],
+        "timezone": voucher["timezone"],
+        "day_start": voucher["day_start"],
+        "day_end": voucher["day_end"],
+        "sealed_at": voucher["sealed_at"],
+        "session_count": voucher["session_count"],
+        "redeemed_count": voucher["redeemed_count"],
+        "unredeemed_count": voucher["unredeemed_count"],
+    }
+
+
+def _progress_voucher_out(voucher: sqlite3.Row, items: list,
+                          replay: bool) -> dict:
+    """Full voucher payload: header + sealed items, exactly as first sealed."""
+    payload = _progress_voucher_summary_out(voucher)
+    payload["items"] = [_progress_voucher_item_out(r) for r in items]
+    payload["replay"] = replay
+    return payload
 
 
 def _decide(candidates: list, start_iso: str, suspended_ids: Optional[set] = None):
@@ -2341,3 +2462,158 @@ class Store:
                 except sqlite3.Error:
                     pass
                 raise
+
+    # ------------------------------------------------------------------
+    # daily screening progress vouchers (sealed snapshots for distributors)
+    # ------------------------------------------------------------------
+    def _progress_voucher_payload(self, conn: sqlite3.Connection,
+                                  voucher: sqlite3.Row, *,
+                                  replay: bool) -> dict:
+        """Read back the stored voucher with its sealed items (never recomputed)."""
+        items = conn.execute(
+            """
+            SELECT * FROM progress_voucher_items
+            WHERE voucher_id = ?
+            ORDER BY start_time ASC, id ASC
+            """,
+            (voucher["id"],),
+        ).fetchall()
+        return _progress_voucher_out(voucher, items, replay)
+
+    def seal_progress_voucher(
+        self,
+        *,
+        voucher_no: str,
+        venue_id: str,
+        local_date: str,
+        timezone_name: str,
+    ) -> dict:
+        """Seal a progress voucher for one venue and one local civil day.
+
+        The snapshot covers screenings whose **current** schedule (including
+        reschedules) falls inside the half-open local day
+        ``[day_start, day_end)`` of ``local_date`` in ``timezone_name`` and
+        which are approved and not cancelled.  Each item records the original
+        verification key, the current start time, the current license/pool,
+        the assigned copy code (``None`` when unassigned) and the opening-code
+        redemption time (``None`` when not redeemed — not-yet-started
+        screenings count as unredeemed).  An empty day seals an empty item
+        list with zero counts.
+
+        The snapshot read and the voucher insert run inside a single
+        ``BEGIN IMMEDIATE`` transaction, serialised against concurrent
+        reschedules, cancellations and redemptions, so the voucher reflects
+        exactly one complete state — never a mix of before/after.  Sealing
+        is idempotent per ``voucher_no``: the same parameters replay the
+        first snapshot (``replay=True``), different parameters conflict
+        (409).  Invalid dates and unknown IANA timezones are rejected (422)
+        without leaving any record.
+        """
+        canon_date, day_start, day_end = _local_day_bounds_utc(
+            local_date, timezone_name
+        )
+        request_hash = _hash_progress_voucher(venue_id, canon_date, timezone_name)
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT * FROM progress_vouchers WHERE voucher_no = ?",
+                    (voucher_no,),
+                ).fetchone()
+                if existing is not None:
+                    # 同号重试：同参数返回首次快照，异参数 409 附首次快照
+                    payload = self._progress_voucher_payload(
+                        conn, existing, replay=True
+                    )
+                    conn.execute("COMMIT")
+                    if existing["request_hash"] != request_hash:
+                        raise ConflictError(
+                            f"progress voucher '{voucher_no}' was already "
+                            "sealed with different parameters",
+                            existing=payload,
+                        )
+                    return payload
+
+                rows = conn.execute(
+                    _PROGRESS_VOUCHER_SNAPSHOT_SELECT,
+                    (venue_id, day_start, day_end),
+                ).fetchall()
+                sealed_at = now_iso()
+                redeemed_count = sum(
+                    1 for r in rows if r["redeemed_at"] is not None
+                )
+                cur = conn.execute(
+                    """
+                    INSERT INTO progress_vouchers
+                        (voucher_no, request_hash, venue_id, local_date,
+                         timezone, day_start, day_end,
+                         session_count, redeemed_count, unredeemed_count,
+                         sealed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (voucher_no, request_hash, venue_id, canon_date,
+                     timezone_name, day_start, day_end,
+                     len(rows), redeemed_count, len(rows) - redeemed_count,
+                     sealed_at),
+                )
+                voucher_id = cur.lastrowid
+                for row in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO progress_voucher_items
+                            (voucher_id, verification_id, idempotency_key,
+                             film_id, start_time, license_id, pool_id,
+                             copy_code, redeemed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (voucher_id, row["verification_id"],
+                         row["idempotency_key"], row["film_id"],
+                         row["start_time"], row["license_id"], row["pool_id"],
+                         row["copy_code"], row["redeemed_at"]),
+                    )
+                voucher = conn.execute(
+                    "SELECT * FROM progress_vouchers WHERE id = ?",
+                    (voucher_id,),
+                ).fetchone()
+                payload = self._progress_voucher_payload(
+                    conn, voucher, replay=False
+                )
+                conn.execute("COMMIT")
+                return payload
+            except ConflictError:
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_progress_voucher(self, voucher_no: str) -> dict:
+        """Fetch a sealed voucher by its number; content never changes."""
+        with self._connection() as conn:
+            voucher = conn.execute(
+                "SELECT * FROM progress_vouchers WHERE voucher_no = ?",
+                (voucher_no,),
+            ).fetchone()
+            if voucher is None:
+                raise NotFoundError(f"progress voucher '{voucher_no}' not found")
+            return self._progress_voucher_payload(conn, voucher, replay=False)
+
+    def list_progress_vouchers(
+        self,
+        *,
+        venue_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> list:
+        """Voucher headers (with counts, without items), newest first."""
+        sql = "SELECT * FROM progress_vouchers"
+        params: list = []
+        if venue_id is not None:
+            sql += " WHERE venue_id = ?"
+            params.append(venue_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_progress_voucher_summary_out(r) for r in rows]

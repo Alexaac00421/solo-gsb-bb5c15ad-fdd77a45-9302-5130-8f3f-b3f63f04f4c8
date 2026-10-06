@@ -30,6 +30,9 @@ from .schemas import (
     OpeningCodeStatusOut,
     PoolCreate,
     PoolOut,
+    ProgressVoucherCreate,
+    ProgressVoucherOut,
+    ProgressVoucherSummaryOut,
     RedeemRequest,
     RedemptionOut,
     RescheduleOut,
@@ -83,8 +86,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.6.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签与实体放映拷贝分配",
+        version="1.7.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销、核准场次改签、实体放映拷贝分配与放映进度凭证封存",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -118,7 +121,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.5.0",
+            "version": "1.7.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -543,6 +546,58 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def get_copy_assignment(idempotency_key: str):
         """查询场次当前的拷贝分配状态；未分配时 assigned=false。未知键 404。"""
         return store.get_copy_assignment(idempotency_key)
+
+    # ------------------------------------------------------------------
+    # daily screening progress vouchers (sealed snapshots for distributors)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/progress-vouchers",
+        response_model=ProgressVoucherOut,
+        status_code=201,
+        tags=["progress-vouchers"],
+    )
+    def seal_progress_voucher(body: ProgressVoucherCreate):
+        """按受理时刻封存某场馆某当地日期的放映进度凭证（幂等）。
+
+        - 提交场馆编号、当地日期（YYYY-MM-DD）与 IANA 时区；封存**当前排片**
+          落在该当地日（左闭右开）内、已核准且未取消的场次：明细含原核验键、
+          当前开场时间、当前授权及额度池、已分配拷贝编号（未分配为 null）、
+          开场码核销时间（未核销为 null）；汇总已核销/未核销场数，未开场
+          场次计入未核销；空日返回空清单及零计数；
+        - 非法日期 422 INVALID_LOCAL_DATE，未知时区 422 UNKNOWN_TIMEZONE，
+          均不落任何记录；
+        - 同一凭证号同参数重试返回首次快照（replay=true），异参数 409；
+        - 快照读取与凭证落库在单个 BEGIN IMMEDIATE 事务内完成，与并发的
+          改签/取消/核销串行：凭证只反映某一完整状态，不混合前后结果；
+          封存后查询恒返回首次内容。
+        """
+        return store.seal_progress_voucher(
+            voucher_no=body.voucher_no,
+            venue_id=body.venue_id,
+            local_date=body.local_date,
+            timezone_name=body.timezone,
+        )
+
+    @app.get(
+        "/progress-vouchers",
+        response_model=list[ProgressVoucherSummaryOut],
+        tags=["progress-vouchers"],
+    )
+    def list_progress_vouchers(
+        venue_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ):
+        """凭证列表（含汇总计数、不含明细），可按 venue_id 过滤。"""
+        return store.list_progress_vouchers(venue_id=venue_id, limit=limit)
+
+    @app.get(
+        "/progress-vouchers/{voucher_no}",
+        response_model=ProgressVoucherOut,
+        tags=["progress-vouchers"],
+    )
+    def get_progress_voucher(voucher_no: str):
+        """按凭证号查询已封存的放映进度凭证；内容保持封存时原样，未知凭证号 404。"""
+        return store.get_progress_voucher(voucher_no)
 
     return app
 

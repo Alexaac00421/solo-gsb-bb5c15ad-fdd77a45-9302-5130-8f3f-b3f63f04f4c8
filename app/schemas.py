@@ -531,3 +531,91 @@ class CopyConflictsOut(BaseModel):
     start_time: str = Field(description="候选开场时刻（UTC）")
     end_time: str = Field(description="候选占用结束时刻 = 开场 + 片长")
     conflicts: list[CopyConflictItem]
+
+
+# ----------------------------------------------------------------------
+# 放映进度凭证：按场馆 + 当地日期 + IANA 时区封存当日进度快照
+# ----------------------------------------------------------------------
+class ProgressVoucherCreate(BaseModel):
+    """封存某场馆某当地日期的放映进度凭证。"""
+
+    voucher_no: str = Field(
+        min_length=1, max_length=128,
+        description="全库唯一凭证号；同号同参数重试返回首次快照，异参数 409",
+        examples=["PV-20261006-0001"],
+    )
+    venue_id: str = Field(
+        min_length=1, max_length=128,
+        description="场馆编号",
+        examples=["hall-1"],
+    )
+    local_date: str = Field(
+        min_length=1, max_length=32,
+        description="当地日期 YYYY-MM-DD（严格格式）；非法日期 422 INVALID_LOCAL_DATE",
+        examples=["2026-10-06"],
+    )
+    timezone: str = Field(
+        min_length=1, max_length=64,
+        description="IANA 时区名，如 Asia/Shanghai；未知时区 422 UNKNOWN_TIMEZONE",
+        examples=["Asia/Shanghai"],
+    )
+
+    @field_validator("voucher_no", "venue_id", "local_date", "timezone")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class ProgressVoucherItemOut(BaseModel):
+    """凭证内一场的封存明细（均为受理时刻的当前值快照）。"""
+
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="核验流水 id")
+    film_id: str = Field(description="场次影片")
+    start_time: str = Field(description="封存时的当前开场时刻（UTC，含改签）")
+    license_id: Optional[int] = Field(description="封存时的当前授权 id")
+    pool_id: Optional[int] = Field(description="封存时的当前共享额度池 id；未绑池为 null")
+    copy_code: Optional[str] = Field(description="封存时已分配的拷贝编号；未分配为 null")
+    redeemed_at: Optional[str] = Field(
+        description="开场码核销时间（UTC）；未核销（含未开场）为 null"
+    )
+
+
+class ProgressVoucherOut(BaseModel):
+    """一份放映进度凭证：封存参数、汇总计数与场次明细。"""
+
+    id: int = Field(description="凭证记录编号")
+    voucher_no: str = Field(description="全库唯一凭证号")
+    venue_id: str
+    local_date: str = Field(description="当地日期 YYYY-MM-DD")
+    timezone: str = Field(description="IANA 时区名")
+    day_start: str = Field(description="该当地日起（含）折算 UTC")
+    day_end: str = Field(description="该当地日止（不含）折算 UTC")
+    sealed_at: str = Field(description="受理封存时刻（UTC）")
+    session_count: int = Field(description="封存场次总数（已核准且未取消、当日场次）")
+    redeemed_count: int = Field(description="其中已核销场数")
+    unredeemed_count: int = Field(description="其中未核销场数（未开场场次计入未核销）")
+    items: list[ProgressVoucherItemOut] = Field(
+        description="封存明细，按当前开场时刻升序；空日为空清单"
+    )
+    replay: bool = Field(
+        description="true 表示同凭证号同参数重试，返回首次封存的快照"
+    )
+
+
+class ProgressVoucherSummaryOut(BaseModel):
+    """凭证列表项（不含明细）。"""
+
+    id: int
+    voucher_no: str
+    venue_id: str
+    local_date: str
+    timezone: str
+    day_start: str
+    day_end: str
+    sealed_at: str
+    session_count: int
+    redeemed_count: int
+    unredeemed_count: int

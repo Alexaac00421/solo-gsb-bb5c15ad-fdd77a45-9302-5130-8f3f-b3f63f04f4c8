@@ -845,4 +845,10 @@ def test_concurrent_assign_and_reschedule_never_oversell(tmp_path):
     occupancy = store.get_copy("COPY-1")["occupancy"]
     at_t2 = [o for o in occupancy if o["start_time"].startswith("2030-06-02")]
     assert len(at_t2) == 1
-    assert len(occupancy) == 2
+    if res["decision"] == "approved":
+        # reschedule won: s-1 moved to T2 and s-2 was never assigned,
+        # so COPY-1 holds exactly one occupancy row
+        assert len(occupancy) == 1
+    else:
+        # assignment won: s-1 stays at T1 and s-2 holds T2
+        assert len(occupancy) == 2
